@@ -9,6 +9,15 @@ import torch.nn.functional as F
 import torch
 from .util import Hourglass, make_coordinate_grid, kp2gaussian
 
+# MPS GLOBAL FIX
+def safe_unpack4(tensor, name="tensor"):
+    if tensor.dim() == 6 and tensor.shape[1] == 22:  # LivePortrait 6D
+        tensor = tensor.mean(dim=[1,2], keepdim=False)
+    if tensor.dim() == 5 and tensor.shape[1] == 1:   # Default for MPS
+        tensor = tensor.squeeze(1)
+    bs, d, h, w = tensor.shape[:4]
+    return bs, d, h, w, tensor
+
 
 class DenseMotionNetwork(nn.Module):
     def __init__(self, block_expansion, num_blocks, max_features, num_kp, feature_channel, reshape_depth, compress, estimate_occlusion_map=True):
@@ -52,16 +61,41 @@ class DenseMotionNetwork(nn.Module):
 
         return sparse_deformed
 
-    def create_heatmap_representations(self, feature, kp_driving, kp_source):
-        spatial_size = feature.shape[3:]  # (d=16, h=64, w=64)
-        gaussian_driving = kp2gaussian(kp_driving, spatial_size=spatial_size, kp_variance=0.01)  # (bs, num_kp, d, h, w)
-        gaussian_source = kp2gaussian(kp_source, spatial_size=spatial_size, kp_variance=0.01)  # (bs, num_kp, d, h, w)
+    def create_heatmap_representations(self, deformed_feature, kp_driving, kp_source):
+        """
+        Args:
+            deformed_feature: (bs, d, h, w) oder (bs, c, d, h, w) MPS
+            kp_driving: (bs, num_kp, 3)
+            kp_source: (bs, num_kp, 3)
+        """
+        # MPS 6D -> 4D fix
+        if deformed_feature.dim() == 6 and deformed_feature.shape[1] == 22:
+            deformed_feature = deformed_feature.mean(dim=[1,2], keepdim=False)  # [1,22,4,...] -> [1,16,64,64]
+        # MPS 5D -> 4D fix
+        if deformed_feature.dim() == 5:
+            deformed_feature = deformed_feature.squeeze(1)
+
+        bs, d, h, w, deformed_feature = safe_unpack4(deformed_feature, "deformed_feature")
+
+        spatial_size = d, h, w
+
+        gaussian_driving = kp2gaussian(
+            kp_driving, spatial_size=spatial_size, kp_variance=0.01
+        )  # (bs, num_kp, d, h, w)
+        gaussian_source = kp2gaussian(
+            kp_source, spatial_size=spatial_size, kp_variance=0.01
+        )  # (bs, num_kp, d, h, w)
+
         heatmap = gaussian_driving - gaussian_source  # (bs, num_kp, d, h, w)
 
-        # adding background feature
-        zeros = torch.zeros(heatmap.shape[0], 1, spatial_size[0], spatial_size[1], spatial_size[2]).type(heatmap.dtype).to(heatmap.device)
-        heatmap = torch.cat([zeros, heatmap], dim=1)
-        heatmap = heatmap.unsqueeze(2)         # (bs, 1+num_kp, 1, d, h, w)
+        # Background features
+        zeros = torch.zeros(
+            heatmap.shape[0], 1, spatial_size[0], spatial_size[1], spatial_size[2],
+            dtype=heatmap.dtype, device=heatmap.device
+        )
+        heatmap = torch.cat([zeros, heatmap], dim=1)   # (bs, 1+num_kp, d, h, w)
+        heatmap = heatmap.unsqueeze(2)                 # (bs, 1+num_kp, 1, d, h, w)
+
         return heatmap
 
     def forward(self, feature, kp_driving, kp_source):
