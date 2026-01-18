@@ -10,12 +10,15 @@ import time
 import copy
 import dill
 import yaml
+import random
+from torchvision import transforms
 from ultralytics import YOLO
 
 current_file_path = os.path.abspath(__file__)
 current_directory = os.path.dirname(current_file_path)
 
 from .LivePortrait.live_portrait_wrapper import LivePortraitWrapper
+from .LivePortrait.utils.rprint import rlog as log
 from .LivePortrait.utils.camera import get_rotation_matrix
 from .LivePortrait.config.inference_config import InferenceConfig
 
@@ -26,20 +29,21 @@ from .LivePortrait.modules.appearance_feature_extractor import AppearanceFeature
 from .LivePortrait.modules.stitching_retargeting_network import StitchingRetargetingNetwork
 from collections import OrderedDict
 
-cur_device = None
-def get_device():
-    global cur_device
-    if cur_device == None:
-        if torch.cuda.is_available():
-            cur_device = torch.device('cuda')
-            print("Uses CUDA device.")
-        elif torch.backends.mps.is_available():
-            cur_device = torch.device('mps')
-            print("Uses MPS device.")
-        else:
-            cur_device = torch.device('cpu')
-            print("Uses CPU device.")
-    return cur_device
+# MPS Tensor-Typ-Fix
+if torch.backends.mps.is_available():
+    torch.set_default_dtype(torch.float32)
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+# Global device variable
+DEVICE = device
+
+def mps_fix_tensor(tensor):
+    """Automatisch alle MPS 5D -> 4D"""
+    if tensor.device.type == 'mps' and tensor.dim() == 5 and tensor.shape[1] == 1:
+        return tensor.squeeze(1)
+    return tensor
 
 def tensor2pil(image):
     return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
@@ -78,7 +82,6 @@ def calc_crop_limit(center, img_size, crop_size):
 
 def retargeting(delta_out, driving_exp, factor, idxes):
     for idx in idxes:
-        #delta_out[0, idx] -= src_exp[0, idx] * factor
         delta_out[0, idx] += driving_exp[0, idx] * factor
 
 class PreparedSrcImg:
@@ -97,11 +100,6 @@ class LP_Engine:
     pipeline = None
     detect_model = None
     mask_img = None
-    temp_img_idx = 0
-
-    def get_temp_img_name(self):
-        self.temp_img_idx += 1
-        return "expression_edit_preview" + str(self.temp_img_idx) + ".png"
 
     def download_model(_, file_path, model_url):
         print('AdvancedLivePortrait: Downloading model...')
@@ -141,9 +139,7 @@ class LP_Engine:
                                key.startswith(prefix)}
         return filtered_checkpoint
 
-    def load_model(self, model_config, model_type):
-
-        device = get_device()
+    def load_model(self, model_config, device, model_type):
 
         if model_type == 'stitching_retargeting_module':
             ckpt_path = os.path.join(get_model_dir("liveportrait"), "retargeting_models", model_type + ".pth")
@@ -159,13 +155,13 @@ class LP_Engine:
                 "https://huggingface.co/Kijai/LivePortrait_safetensors/resolve/main/" + model_type + ".safetensors")
         model_params = model_config['model_params'][f'{model_type}_params']
         if model_type == 'appearance_feature_extractor':
-            model = AppearanceFeatureExtractor(**model_params).to(device)
+            model = AppearanceFeatureExtractor(**model_params).to(DEVICE)
         elif model_type == 'motion_extractor':
-            model = MotionExtractor(**model_params).to(device)
+            model = MotionExtractor(**model_params).to(DEVICE)
         elif model_type == 'warping_module':
-            model = WarpingNetwork(**model_params).to(device)
+            model = WarpingNetwork(**model_params).to(DEVICE)
         elif model_type == 'spade_generator':
-            model = SPADEDecoder(**model_params).to(device)
+            model = SPADEDecoder(**model_params).to(DEVICE)
         elif model_type == 'stitching_retargeting_module':
             # Special handling for stitching and retargeting module
             config = model_config['model_params']['stitching_retargeting_module_params']
@@ -176,7 +172,7 @@ class LP_Engine:
                 stitcher.load_state_dict(self.filter_for_model(checkpoint, 'retarget_shoulder'))
             else:
                 stitcher.load_state_dict(self.remove_ddp_dumplicate_key(checkpoint['retarget_shoulder']))
-            stitcher = stitcher.to(device)
+            stitcher = stitcher.to(DEVICE)
             stitcher.eval()
 
             return {
@@ -198,13 +194,16 @@ class LP_Engine:
         model_config_path = os.path.join(current_directory, 'LivePortrait', 'config', 'models.yaml')
         model_config = yaml.safe_load(open(model_config_path, 'r'))
 
-        appearance_feature_extractor = self.load_model(model_config, 'appearance_feature_extractor')
-        motion_extractor = self.load_model(model_config, 'motion_extractor')
-        warping_module = self.load_model(model_config, 'warping_module')
-        spade_generator = self.load_model(model_config, 'spade_generator')
-        stitching_retargeting_module = self.load_model(model_config, 'stitching_retargeting_module')
+        device_id = 0
+        appearance_feature_extractor = self.load_model(model_config, DEVICE, 'appearance_feature_extractor')
+        motion_extractor = self.load_model(model_config, DEVICE, 'motion_extractor')
+        warping_module = self.load_model(model_config, DEVICE, 'warping_module')
+        spade_generator = self.load_model(model_config, DEVICE, 'spade_generator')
+        stitching_retargeting_module = self.load_model(model_config, DEVICE, 'stitching_retargeting_module')
 
         self.pipeline = LivePortraitWrapper(InferenceConfig(), appearance_feature_extractor, motion_extractor, warping_module, spade_generator, stitching_retargeting_module)
+        print(f"Using device: {torch.device(DEVICE)}")
+        print(f"MPS available: {torch.backends.mps.is_available()}")
 
     def get_detect_model(self):
         if self.detect_model == None:
@@ -217,95 +216,52 @@ class LP_Engine:
 
         return self.detect_model
 
-    def get_face_bboxes(self, image_rgb):
-        detect_model = self.get_detect_model()
-        pred = detect_model(image_rgb, conf=0.7, device="")
-        return pred[0].boxes.xyxy.cpu().numpy()
+    def detect_face(self, image_rgb, crop_factor):
 
-    def detect_face(self, image_rgb, crop_factor, sort = True):
-        bboxes = self.get_face_bboxes(image_rgb)
+        #crop_factor = 1.7
+        bbox_drop_size = 10
+        detect_model = self.get_detect_model()
+
+        pred = detect_model(image_rgb, conf=0.7, device="")
+        bboxes = pred[0].boxes.xyxy.cpu().numpy()
+
         w, h = get_rgb_size(image_rgb)
 
-        print(f"w, h:{w, h}")
-
-        cx = w / 2
-        min_diff = w
-        best_box = None
+        # for x, label in zip(segmasks, detected_results[0]):
         for x1, y1, x2, y2 in bboxes:
             bbox_w = x2 - x1
-            if bbox_w < 30: continue
-            diff = abs(cx - (x1 + bbox_w / 2))
-            if diff < min_diff:
-                best_box = [x1, y1, x2, y2]
-                print(f"diff, min_diff, best_box:{diff, min_diff, best_box}")
-                min_diff = diff
+            bbox_h = y2 - y1
 
-        if best_box == None:
-            print("Failed to detect face!!")
-            return [0, 0, w, h]
+            crop_w = bbox_w * crop_factor
+            crop_h = bbox_h * crop_factor
 
-        x1, y1, x2, y2 = best_box
+            crop_w = max(crop_h, crop_w)
+            crop_h = crop_w
 
-        #for x1, y1, x2, y2 in bboxes:
-        bbox_w = x2 - x1
-        bbox_h = y2 - y1
+            kernel_x = x1 + bbox_w / 2
+            kernel_y = y1 + bbox_h / 2
 
-        crop_w = bbox_w * crop_factor
-        crop_h = bbox_h * crop_factor
+            new_x1 = kernel_x - crop_w / 2
+            new_x2 = kernel_x + crop_w / 2
+            new_y1 = kernel_y - crop_h / 2
+            new_y2 = kernel_y + crop_h / 2
 
-        crop_w = max(crop_h, crop_w)
-        crop_h = crop_w
-
-        kernel_x = int(x1 + bbox_w / 2)
-        kernel_y = int(y1 + bbox_h / 2)
-
-        new_x1 = int(kernel_x - crop_w / 2)
-        new_x2 = int(kernel_x + crop_w / 2)
-        new_y1 = int(kernel_y - crop_h / 2)
-        new_y2 = int(kernel_y + crop_h / 2)
-
-        if not sort:
             return [int(new_x1), int(new_y1), int(new_x2), int(new_y2)]
 
-        if new_x1 < 0:
-            new_x2 -= new_x1
-            new_x1 = 0
-        elif w < new_x2:
-            new_x1 -= (new_x2 - w)
-            new_x2 = w
-            if new_x1 < 0:
-                new_x2 -= new_x1
-                new_x1 = 0
-
-        if new_y1 < 0:
-            new_y2 -= new_y1
-            new_y1 = 0
-        elif h < new_y2:
-            new_y1 -= (new_y2 - h)
-            new_y2 = h
-            if new_y1 < 0:
-                new_y2 -= new_y1
-                new_y1 = 0
-
-        if w < new_x2 and h < new_y2:
-            over_x = new_x2 - w
-            over_y = new_y2 - h
-            over_min = min(over_x, over_y)
-            new_x2 -= over_min
-            new_y2 -= over_min
-
-        return [int(new_x1), int(new_y1), int(new_x2), int(new_y2)]
-
+        print("Failed to detect face!!")
+        return [0, 0, w, h]
 
     def calc_face_region(self, square, dsize):
         region = copy.deepcopy(square)
         is_changed = False
-        if dsize[0] < region[2]:
-            region[2] = dsize[0]
-            is_changed = True
-        if dsize[1] < region[3]:
-            region[3] = dsize[1]
-            is_changed = True
+        if region[0] < 0: region[0] = 0
+        if region[1] < 0: region[1] = 0
+        if dsize[0] < region[2]: region[2] = dsize[0]
+        if dsize[1] < region[3]: region[3] = dsize[1]
+        for i in range(4):
+            if region[i] != square[i]:
+                is_changed = True
+                break
 
         return region, is_changed
 
@@ -327,9 +283,7 @@ class LP_Engine:
         h, w = img.shape[:2]
         input_shape = [256,256]
         if h != input_shape[0] or w != input_shape[1]:
-            if 256 < h: interpolation = cv2.INTER_AREA
-            else: interpolation = cv2.INTER_LINEAR
-            x = cv2.resize(img, (input_shape[0], input_shape[1]), interpolation = interpolation)
+            x = cv2.resize(img, (input_shape[0], input_shape[1]), interpolation = cv2.INTER_LINEAR)
         else:
             x = img.copy()
 
@@ -339,9 +293,11 @@ class LP_Engine:
             x = x.astype(np.float32) / 255.  # BxHxWx3, normalized to 0~1
         else:
             raise ValueError(f'img ndim should be 3 or 4: {x.ndim}')
+        
         x = np.clip(x, 0, 1)  # clip to 0~1
         x = torch.from_numpy(x).permute(0, 3, 1, 2)  # 1xHxWx3 -> 1x3xHxW
-        x = x.to(get_device())
+        x = x.to(DEVICE)
+        x = mps_fix_tensor(x)
         return x
 
     def GetMaskImg(self):
@@ -357,28 +313,26 @@ class LP_Engine:
         if is_changed: face_img = self.expand_img(face_img, crop_region)
         return face_img
 
-    def prepare_source(self, source_image, crop_factor, is_video = False, tracking = False):
+    def prepare_source(self, source_image, crop_factor, is_video = False):
         print("Prepare source...")
         engine = self.get_pipeline()
         source_image_np = (source_image * 255).byte().numpy()
         img_rgb = source_image_np[0]
+        crop_region = self.detect_face(img_rgb, crop_factor)
+        face_region, is_changed = self.calc_face_region(crop_region, get_rgb_size(img_rgb))
+
+        s_x = (face_region[2] - face_region[0]) / 512.
+        s_y = (face_region[3] - face_region[1]) / 512.
+        crop_trans_m = create_transform_matrix(crop_region[0], crop_region[1], s_x, s_y)
+        mask_ori = cv2.warpAffine(self.GetMaskImg(), crop_trans_m, get_rgb_size(img_rgb), cv2.INTER_LINEAR)
+        mask_ori = mask_ori.astype(np.float32) / 255.
+
+        if is_changed:
+            s = (crop_region[2] - crop_region[0]) / 512.
+            crop_trans_m = create_transform_matrix(crop_region[0], crop_region[1], s, s)
 
         psi_list = []
         for img_rgb in source_image_np:
-            if tracking or len(psi_list) == 0:
-                crop_region = self.detect_face(img_rgb, crop_factor)
-                face_region, is_changed = self.calc_face_region(crop_region, get_rgb_size(img_rgb))
-
-                s_x = (face_region[2] - face_region[0]) / 512.
-                s_y = (face_region[3] - face_region[1]) / 512.
-                crop_trans_m = create_transform_matrix(crop_region[0], crop_region[1], s_x, s_y)
-                mask_ori = cv2.warpAffine(self.GetMaskImg(), crop_trans_m, get_rgb_size(img_rgb), cv2.INTER_LINEAR)
-                mask_ori = mask_ori.astype(np.float32) / 255.
-
-                if is_changed:
-                    s = (crop_region[2] - crop_region[0]) / 512.
-                    crop_trans_m = create_transform_matrix(crop_region[0], crop_region[1], s, s)
-
             face_img = rgb_crop(img_rgb, face_region)
             if is_changed: face_img = self.expand_img(face_img, crop_region)
             i_s = self.prepare_src_image(face_img)
@@ -399,8 +353,9 @@ class LP_Engine:
 
         out_list = []
         for f_img in f_img_np:
-            i_d = self.prepare_src_image(f_img)
+            i_d = pipeline.prepare_source(f_img)
             d_info = pipeline.get_kp_info(i_d)
+            #out_list.append((d_info, get_rotation_matrix(d_info['pitch'], d_info['yaw'], d_info['roll'])))
             out_list.append(d_info)
 
         return out_list
@@ -455,8 +410,6 @@ class LP_Engine:
         x_d_new[0, 13, 1] += eyes * 0.0003
         x_d_new[0, 15, 1] += eyes * -0.001
         x_d_new[0, 16, 1] += eyes * 0.0003
-        x_d_new[0, 1, 1] += eyes * -0.00025
-        x_d_new[0, 2, 1] += eyes * 0.00025
 
 
         if 0 < eyebrow:
@@ -485,7 +438,7 @@ class ExpressionSet:
             self.s = erst[2]
             self.t = erst[3]
         else:
-            self.e = torch.from_numpy(np.zeros((1, 21, 3))).float().to(get_device())
+            self.e = torch.from_numpy(np.zeros((1, 21, 3))).float().to(DEVICE)
             self.r = torch.Tensor([0, 0, 0])
             self.s = 0
             self.t = 0
@@ -598,17 +551,22 @@ class ExpData:
     CATEGORY = "AdvancedLivePortrait"
 
     def run(self, code1, value1, code2, value2, code3, value3, code4, value4, code5, value5, add_exp=None):
+        #print(f"type(None):{type(None)}")
+        #if type(add_exp) == type(None):
         if add_exp == None:
             es = ExpressionSet()
+            log(f"exp11:{es.exp[0,1,1]}")
         else:
             es = ExpressionSet(es = add_exp)
+            if id(es.exp) == id(add_exp.exp):
+                log("id(es.exp) == id(add_exp.exp) is True")
 
         codes = [code1, code2, code3, code4, code5]
         values = [value1, value2, value3, value4, value5]
         for i in range(5):
             idx = int(codes[i] / 10)
             r = codes[i] % 10
-            es.e[0, idx, r] += values[i] * 0.001
+            es.exp[0, idx, r] += values[i] * 0.001
 
         return (es,)
 
@@ -646,11 +604,6 @@ class Command:
         self.es:ExpressionSet = es
         self.change = change
         self.keep = keep
-
-crop_factor_default = 1.7
-crop_factor_min = 1.5
-crop_factor_max = 2.5
-
 class AdvancedLivePortrait:
     def __init__(self):
         self.src_images = None
@@ -665,11 +618,8 @@ class AdvancedLivePortrait:
             "required": {
                 "retargeting_eyes": ("FLOAT", {"default": 0, "min": 0, "max": 1, "step": 0.01}),
                 "retargeting_mouth": ("FLOAT", {"default": 0, "min": 0, "max": 1, "step": 0.01}),
-                "crop_factor": ("FLOAT", {"default": crop_factor_default,
-                                          "min": crop_factor_min, "max": crop_factor_max, "step": 0.1}),
+                "crop_factor": ("FLOAT", {"default": 2, "min": 1.5, "max": 3, "step": 0.1}),
                 "turn_on": ("BOOLEAN", {"default": True}),
-                "tracking_src_vid": ("BOOLEAN", {"default": False}),
-                "animate_without_vid": ("BOOLEAN", {"default": False}),
                 "command": ("STRING", {"multiline": True, "default": ""}),
             },
             "optional": {
@@ -723,7 +673,7 @@ class AdvancedLivePortrait:
         return cmd_list, total_length
 
 
-    def run(self, retargeting_eyes, retargeting_mouth, turn_on, tracking_src_vid, animate_without_vid, command, crop_factor,
+    def run(self, retargeting_eyes, retargeting_mouth, turn_on, command, crop_factor,
             src_images=None, driving_images=None, motion_link=None):
         if turn_on == False: return (None,None)
         src_length = 1
@@ -739,7 +689,7 @@ class AdvancedLivePortrait:
                 self.crop_factor = crop_factor
                 self.src_images = src_images
                 if 1 < src_length:
-                    self.psi_list = g_engine.prepare_source(src_images, crop_factor, True, tracking_src_vid)
+                    self.psi_list = g_engine.prepare_source(src_images, crop_factor, True)
                 else:
                     self.psi_list = [g_engine.prepare_source(src_images, crop_factor)]
 
@@ -755,10 +705,8 @@ class AdvancedLivePortrait:
                 self.driving_values = g_engine.prepare_driving_video(driving_images)
             driving_length = len(self.driving_values)
 
+        #total_length = max(driving_length, cmd_length, src_length)
         total_length = max(driving_length, src_length)
-
-        if animate_without_vid:
-            total_length = max(total_length, cmd_length)
 
         c_i_es = ExpressionSet()
         c_o_es = ExpressionSet()
@@ -778,6 +726,7 @@ class AdvancedLivePortrait:
 
             if i < cmd_length:
                 cmd = cmd_list[cmd_idx]
+                #cmd = Command()#지울거
                 if 0 < cmd.change:
                     cmd.change -= 1
                     c_i_es.add(cmd.es)
@@ -802,7 +751,6 @@ class AdvancedLivePortrait:
 
                 if d_0_es is None:
                     d_0_es = ExpressionSet(erst = (d_i_info['exp'], d_i_r, d_i_info['scale'], d_i_info['t']))
-
                     retargeting(s_es.e, d_0_es.e, retargeting_eyes, (11, 13, 15, 16))
                     retargeting(s_es.e, d_0_es.e, retargeting_mouth, (14, 17, 19, 20))
 
@@ -814,7 +762,10 @@ class AdvancedLivePortrait:
                 s_info['pitch'] + new_es.r[0], s_info['yaw'] + new_es.r[1], s_info['roll'] + new_es.r[2])
             d_new = new_es.s * (new_es.e @ r_new) + new_es.t
             d_new = pipeline.stitching(psi.x_s_user, d_new)
-            crop_out = pipeline.warp_decode(psi.f_s_user, psi.x_s_user, d_new)
+            # MPS Tensor Dimension Fix
+            psi.f_s_user = mps_fix_tensor(psi.f_s_user)
+            psi.x_s_user = mps_fix_tensor(psi.x_s_user) 
+            crop_out = pipeline.warp_decode(psi.f_s_user, psi.x_s_user, x_d_new)
             crop_out = pipeline.parse_output(crop_out['out'])[0]
 
             crop_with_fullsize = cv2.warpAffine(crop_out, psi.crop_trans_m, get_rgb_size(psi.src_rgb),
@@ -858,10 +809,8 @@ class ExpressionEditor:
                 "smile": ("FLOAT", {"default": 0, "min": -0.3, "max": 1.3, "step": 0.01, "display": display}),
 
                 "src_ratio": ("FLOAT", {"default": 1, "min": 0, "max": 1, "step": 0.01, "display": display}),
-                "sample_ratio": ("FLOAT", {"default": 1, "min": -0.2, "max": 1.2, "step": 0.01, "display": display}),
-                "sample_parts": (["OnlyExpression", "OnlyRotation", "OnlyMouth", "OnlyEyes", "All"],),
-                "crop_factor": ("FLOAT", {"default": crop_factor_default,
-                                          "min": crop_factor_min, "max": crop_factor_max, "step": 0.1}),
+                "sample_ratio": ("FLOAT", {"default": 1, "min": 0, "max": 1, "step": 0.01, "display": display}),
+                "crop_factor": ("FLOAT", {"default": 2, "min": 1.5, "max": 3, "step": 0.1, "display": display}),
             },
 
             "optional": {"src_image": ("IMAGE",), "motion_link": ("EDITOR_LINK",),
@@ -882,7 +831,7 @@ class ExpressionEditor:
     # OUTPUT_IS_LIST = (False,)
 
     def run(self, rotate_pitch, rotate_yaw, rotate_roll, blink, eyebrow, wink, pupil_x, pupil_y, aaa, eee, woo, smile,
-            src_ratio, sample_ratio, sample_parts, crop_factor, src_image=None, sample_image=None, motion_link=None, add_exp=None):
+            src_ratio, sample_ratio, crop_factor, src_image=None, sample_image=None, motion_link=None, add_exp=None):
         rotate_yaw = -rotate_yaw
 
         new_editor_link = None
@@ -915,22 +864,13 @@ class ExpressionEditor:
                 self.sample_image = sample_image
                 d_image_np = (sample_image * 255).byte().numpy()
                 d_face = g_engine.crop_face(d_image_np[0], 1.7)
-                i_d = g_engine.prepare_src_image(d_face)
+                i_d = pipeline.prepare_source(d_face)
                 self.d_info = pipeline.get_kp_info(i_d)
                 self.d_info['exp'][0, 5, 0] = 0
                 self.d_info['exp'][0, 5, 1] = 0
 
-            # "OnlyExpression", "OnlyRotation", "OnlyMouth", "OnlyEyes", "All"
-            if sample_parts == "OnlyExpression" or sample_parts == "All":
-                es.e += self.d_info['exp'] * sample_ratio
-            if sample_parts == "OnlyRotation" or sample_parts == "All":
-                rotate_pitch += self.d_info['pitch'] * sample_ratio
-                rotate_yaw += self.d_info['yaw'] * sample_ratio
-                rotate_roll += self.d_info['roll'] * sample_ratio
-            elif sample_parts == "OnlyMouth":
-                retargeting(es.e, self.d_info['exp'], sample_ratio, (14, 17, 19, 20))
-            elif sample_parts == "OnlyEyes":
-                retargeting(es.e, self.d_info['exp'], sample_ratio, (1, 2, 11, 13, 15, 16))
+            # delta_new += s_exp * (1 - sample_ratio) + self.d_info['exp'] * sample_ratio
+            es.e += self.d_info['exp'] * sample_ratio
 
         es.r = g_engine.calc_fe(es.e, blink, eyebrow, wink, pupil_x, pupil_y, aaa, eee, woo, smile,
                                   rotate_pitch, rotate_yaw, rotate_roll)
@@ -943,16 +883,20 @@ class ExpressionEditor:
         x_d_new = (s_info['scale'] * (1 + es.s)) * ((s_exp + es.e) @ new_rotate) + s_info['t']
 
         x_d_new = pipeline.stitching(psi.x_s_user, x_d_new)
-
+        # MPS Tensor Dimension Fix
+        psi.f_s_user = mps_fix_tensor(psi.f_s_user)
+        psi.x_s_user = mps_fix_tensor(psi.x_s_user) 
         crop_out = pipeline.warp_decode(psi.f_s_user, psi.x_s_user, x_d_new)
         crop_out = pipeline.parse_output(crop_out['out'])[0]
 
         crop_with_fullsize = cv2.warpAffine(crop_out, psi.crop_trans_m, get_rgb_size(psi.src_rgb), cv2.INTER_LINEAR)
         out = np.clip(psi.mask_ori * crop_with_fullsize + (1 - psi.mask_ori) * psi.src_rgb, 0, 255).astype(np.uint8)
 
+        print(psi.mask_ori.shape)
+
         out_img = pil2tensor(out)
 
-        filename = g_engine.get_temp_img_name() #"fe_edit_preview.png"
+        filename = "fe_edit_preview.png"
         folder_paths.get_save_image_path(filename, folder_paths.get_temp_directory())
         img = Image.fromarray(crop_out)
         img.save(os.path.join(folder_paths.get_temp_directory(), filename), compress_level=1)
