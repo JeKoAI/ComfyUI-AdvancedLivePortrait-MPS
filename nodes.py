@@ -40,9 +40,12 @@ else:
 DEVICE = device
 
 def mps_fix_tensor(tensor):
-    """Automatisch alle MPS 5D -> 4D"""
-    if tensor.device.type == 'mps' and tensor.dim() == 5 and tensor.shape[1] == 1:
-        return tensor.squeeze(1)
+    if tensor.device.type == 'mps':
+        dims = tensor.dim()
+        if dims == 6 and tensor.shape[1:3].tolist() == [22, 4]:
+            tensor = tensor.reshape(1, 16, 64, 64)  
+        elif dims == 5 and tensor.shape[1] == 1:
+            tensor = tensor.squeeze(1)
     return tensor
 
 def tensor2pil(image):
@@ -269,7 +272,7 @@ class LP_Engine:
         #new_img = rgb_crop(rgb_img, face_region)
         crop_trans_m = create_transform_matrix(max(-square[0], 0), max(-square[1], 0), 1, 1)
         new_img = cv2.warpAffine(rgb_img, crop_trans_m, (square[2] - square[0], square[3] - square[1]),
-                                        cv2.INTER_LINEAR)
+                                        cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT_101)
         return new_img
 
     def get_pipeline(self):
@@ -551,8 +554,6 @@ class ExpData:
     CATEGORY = "AdvancedLivePortrait"
 
     def run(self, code1, value1, code2, value2, code3, value3, code4, value4, code5, value5, add_exp=None):
-        #print(f"type(None):{type(None)}")
-        #if type(add_exp) == type(None):
         if add_exp == None:
             es = ExpressionSet()
             log(f"exp11:{es.exp[0,1,1]}")
@@ -768,8 +769,10 @@ class AdvancedLivePortrait:
             crop_out = pipeline.warp_decode(psi.f_s_user, psi.x_s_user, x_d_new)
             crop_out = pipeline.parse_output(crop_out['out'])[0]
 
-            crop_with_fullsize = cv2.warpAffine(crop_out, psi.crop_trans_m, get_rgb_size(psi.src_rgb),
-                                                cv2.INTER_LINEAR)
+            crop_with_fullsize = cv2.warpAffine(crop_out, psi.crop_trans_m, 
+                                   get_rgb_size(psi.src_rgb), 
+                                   cv2.INTER_LANCZOS4,
+                                   borderMode=cv2.BORDER_REFLECT_101)
             out = np.clip(psi.mask_ori * crop_with_fullsize + (1 - psi.mask_ori) * psi.src_rgb, 0, 255).astype(
                 np.uint8)
             out_list.append(out)
@@ -869,8 +872,8 @@ class ExpressionEditor:
                 self.d_info['exp'][0, 5, 0] = 0
                 self.d_info['exp'][0, 5, 1] = 0
 
-            # delta_new += s_exp * (1 - sample_ratio) + self.d_info['exp'] * sample_ratio
-            es.e += self.d_info['exp'] * sample_ratio
+            #MPS precision boost
+            es.e = (es.e + self.d_info['exp'].float() * sample_ratio).clamp(-2, 2)
 
         es.r = g_engine.calc_fe(es.e, blink, eyebrow, wink, pupil_x, pupil_y, aaa, eee, woo, smile,
                                   rotate_pitch, rotate_yaw, rotate_roll)
@@ -886,10 +889,13 @@ class ExpressionEditor:
         # MPS Tensor Dimension Fix
         psi.f_s_user = mps_fix_tensor(psi.f_s_user)
         psi.x_s_user = mps_fix_tensor(psi.x_s_user) 
-        crop_out = pipeline.warp_decode(psi.f_s_user, psi.x_s_user, x_d_new)
-        crop_out = pipeline.parse_output(crop_out['out'])[0]
+        ret_dct = pipeline.warp_decode(psi.f_s_user, psi.x_s_user, x_d_new)
+        crop_out = ret_dct['out'].float()
+        crop_out = pipeline.parse_output(crop_out)[0]
 
-        crop_with_fullsize = cv2.warpAffine(crop_out, psi.crop_trans_m, get_rgb_size(psi.src_rgb), cv2.INTER_LINEAR)
+        crop_with_fullsize = cv2.warpAffine(crop_out, psi.crop_trans_m, get_rgb_size(psi.src_rgb), 
+                                   cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT_101)
+        # Final blending
         out = np.clip(psi.mask_ori * crop_with_fullsize + (1 - psi.mask_ori) * psi.src_rgb, 0, 255).astype(np.uint8)
 
         print(psi.mask_ori.shape)
